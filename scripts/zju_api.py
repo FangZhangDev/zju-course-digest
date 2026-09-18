@@ -305,6 +305,10 @@ class ZdbkApi:
             kwargs.setdefault("follow_redirects", True)
             return self._webvpn.make_client(**kwargs)
         kwargs.setdefault("follow_redirects", False)
+        # 直连模式忽略环境代理（见 zju_env.py 说明）
+        from zju_console import env_proxy_disabled
+        if env_proxy_disabled():
+            kwargs.setdefault("trust_env", False)
         return httpx.AsyncClient(**kwargs)
 
     async def _post(self, url: str, data: str = "") -> str:
@@ -414,6 +418,10 @@ class CoursesApi:
             kwargs.setdefault("follow_redirects", True)
             return self._webvpn.make_client(**kwargs)
         kwargs.setdefault("verify", _COURSES_SSL_CTX)
+        # 直连模式忽略环境代理（见 zju_env.py 说明）
+        from zju_console import env_proxy_disabled
+        if env_proxy_disabled():
+            kwargs.setdefault("trust_env", False)
         return httpx.AsyncClient(**kwargs)
 
     def _request_cookies(self) -> dict:

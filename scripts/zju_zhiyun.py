@@ -174,6 +174,10 @@ class ZhiyunApi:
             kwargs.setdefault("verify", True)
             return self._webvpn.make_client(**kwargs)
         kwargs.setdefault("verify", _ssl_context_allow_legacy_dh())
+        # 直连模式忽略环境代理（见 zju_env.py 说明）
+        from zju_console import env_proxy_disabled
+        if env_proxy_disabled():
+            kwargs.setdefault("trust_env", False)
         return httpx.AsyncClient(**kwargs)
 
     @staticmethod
@@ -1296,7 +1300,9 @@ async def _cmd_courseware_pdf(
         img_files = []
         for slide in timeline:
             try:
-                resp = urllib.request.urlopen(urllib.request.Request(slide["image_url"]), timeout=30)
+                resp = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({})
+                ).open(urllib.request.Request(slide["image_url"]), timeout=30)
                 path = os.path.join(tmpdir, f"s{len(img_files):04d}.jpg")
                 with open(path, "wb") as f:
                     f.write(resp.read())
@@ -1455,8 +1461,9 @@ def main():
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from zju_console import ensure_utf8_io
+    from zju_console import ensure_direct_network, ensure_utf8_io
     ensure_utf8_io()
+    ensure_direct_network()
 
     parser = argparse.ArgumentParser(description="智云课堂工具")
     sub = parser.add_subparsers(dest="command", required=True)

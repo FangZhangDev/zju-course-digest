@@ -49,6 +49,12 @@ class ZjuAuth:
             kwargs.setdefault("verify", True)
             return self._webvpn.make_client(**kwargs)
         kwargs.setdefault("verify", _ssl_context_allow_legacy_dh())
+        # 直连模式：忽略环境变量里的 HTTP(S)_PROXY。部分 Host（IDE / Agent
+        # 运行时 / 企业代理）会注入代理变量，httpx 默认 trust_env=True 会把
+        # 校内直连请求送到该代理，导致 ConnectError。校园网直连本就不该走代理。
+        from zju_console import env_proxy_disabled
+        if env_proxy_disabled():
+            kwargs.setdefault("trust_env", False)
         return httpx.AsyncClient(**kwargs)
 
     def _convert_redirect(self, location: str) -> str:

@@ -226,6 +226,10 @@ class WebVpnSession:
         kwargs.setdefault("timeout", self.timeout)
         kwargs.setdefault("verify", True)
         kwargs.setdefault("follow_redirects", True)
+        # WebVPN 与 Host 注入的环境代理叠加会导致连接失败，统一不走环境代理
+        from zju_console import env_proxy_disabled
+        if env_proxy_disabled():
+            kwargs.setdefault("trust_env", False)
 
         client = httpx.AsyncClient(cookies=self.cookies, **kwargs)
         return client

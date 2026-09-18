@@ -29,7 +29,7 @@ SESSION_FILE = DATA_DIR / "session.json"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from zju_auth import ZjuAuth
-from zju_console import ensure_utf8_io
+from zju_console import ensure_direct_network, ensure_utf8_io
 
 
 JWT_RE = re.compile(r"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)")
@@ -215,8 +215,42 @@ def show_status():
         print("  未登录")
 
 
+def show_network():
+    """打印网络环境诊断，帮助定位「直连被代理拦截」类问题。"""
+    from zju_env import describe_proxy_env, is_zju_url  # noqa: F401
+
+    print("=== 网络环境 ===")
+    proxies = describe_proxy_env()
+    if proxies:
+        print("  检测到环境代理变量（直连模式下会自动忽略）：")
+        for k, v in proxies.items():
+            print(f"    {k} = {v}")
+    else:
+        print("  未检测到环境代理变量")
+
+    print("\n=== 浙大服务连通性 ===")
+    import httpx
+
+    targets = [
+        ("统一认证", "https://zjuam.zju.edu.cn/cas/login"),
+        ("学在浙大", "https://courses.zju.edu.cn/user/index"),
+        ("智云课堂", "https://classroom.zju.edu.cn/"),
+    ]
+    for name, url in targets:
+        try:
+            kwargs = {"timeout": 10, "follow_redirects": True, "trust_env": False}
+            if "courses.zju.edu.cn" in url:
+                from zju_auth import _ssl_context_allow_legacy_dh
+                kwargs["verify"] = _ssl_context_allow_legacy_dh()
+            r = httpx.get(url, **kwargs)
+            print(f"  {name}: OK ({r.status_code})")
+        except Exception as e:
+            print(f"  {name}: 失败 — {type(e).__name__}: {str(e)[:80]}")
+
+
 def main():
     ensure_utf8_io()
+    ensure_direct_network()
     parser = argparse.ArgumentParser(description="浙大统一认证登录")
     parser.add_argument("-u", "--username", help="学号")
     parser.add_argument("-p", "--password", help="密码")
@@ -224,7 +258,12 @@ def main():
     parser.add_argument("--save-only", action="store_true", help="只保存凭证不登录")
     parser.add_argument("--webvpn", action="store_true", help="强制通过 WebVPN 登录（校外网络）")
     parser.add_argument("--status", action="store_true", help="查看当前状态")
+    parser.add_argument("--network", action="store_true", help="诊断网络环境与浙大服务连通性")
     args = parser.parse_args()
+
+    if args.network:
+        show_network()
+        return
 
     if args.status:
         show_status()

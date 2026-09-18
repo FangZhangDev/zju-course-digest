@@ -13,16 +13,20 @@ description: 浙江大学课程自动整理工具——抓取智云课堂最新�
 
 ## 目录约定
 
-- Skill 安装源：`~/.agent-config/skills/zju-course-digest/`（唯一源，四客户端软链接）
-- 脚本：`<SKILL>/scripts/`，本 README 中 `<SKILL>` = `~/.claude/skills/zju-course-digest`（软链接等价）
-- Python：建议用专用环境（Python 3.11+，依赖见 `scripts/requirements.txt`），下文以 `$PY` 指代
+- 脚本：`<SKILL>/scripts/`（`<SKILL>` 即本 skill 的安装目录）
+- 常见安装位置：
+  - WorkBuddy / CodeBuddy：`~/.workbuddy/skills/zju-course-digest`
+  - Claude Code：`~/.claude/skills/zju-course-digest`
+  - 其他 agent CLI：各自的 skills 目录，或软链接过去
+  - 均可用 `$(dirname "$(find ~ -name zju_collect.py -path '*zju-course-digest*' 2>/dev/null | head -1)")/..` 定位
+- Python：建议用专用虚拟环境（Python 3.11+，依赖见 `scripts/requirements.txt`），下文以 `$PY` 指代
 - 数据默认落在 `<SKILL>/data/courses/<课程名>/<YYYY-MM-DD>/`，也可用 `--data-dir` 指到课程项目目录
 
 ## 第 0 步：登录（首次或 session 过期时）
 
 ```bash
-cd ~/.claude/skills/zju-course-digest
-# $PY 指向你的 Python 3.11+ 解释器（建议 conda 独立环境）
+cd <SKILL>
+# $PY 指向专用虚拟环境的 python（Python 3.11+）
 PY=python
 
 # 首次：学号密码登录（自动检测校内直连/WebVPN）
@@ -33,11 +37,29 @@ $PY scripts/zju_login.py
 
 # 查看状态
 $PY scripts/zju_login.py --status
+
+# 网络诊断（连不上时先跑这个）
+$PY scripts/zju_login.py --network
 ```
 
 - 凭证与 session 保存在 `<SKILL>/data/credentials.json`、`data/session.json`，已在 `.gitignore`，严禁提交 Git
 - Session 会过期；查询报 401/未登录时重跑 `zju_login.py` 即可
 - 校外网络自动走 WebVPN，无需配置
+
+## 环境适配说明
+
+本 skill 在 IDE / Agent 运行时（如 WorkBuddy）中运行时，宿主可能注入
+`HTTP_PROXY` / `HTTPS_PROXY` 环境变量。浙大服务在校园网内是直连的，
+被强制走代理会表现为 `httpx.ConnectError`。本 skill 已自动处理：
+
+- 所有 CLI 入口启动时调用 `ensure_direct_network()` 清理代理变量
+- 各 API 客户端创建时设 `trust_env=False`，不读环境代理
+- PPT 图片下载用 `ProxyHandler({})` 的 opener
+
+因此**不需要**手动 `unset HTTP_PROXY`。如仍连不上，先跑
+`zju_login.py --network` 看具体是哪一项失败。
+
+> 若你确实需要走外部代理访问（极少见），可设 `ZJU_USE_ENV_PROXY=1` 跳过自动清理。
 
 ## 第 1 步：列课程
 

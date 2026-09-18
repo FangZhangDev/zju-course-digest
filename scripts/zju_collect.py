@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from zju_console import ensure_utf8_io
+from zju_console import ensure_direct_network, ensure_utf8_io
 from zju_session import get_courses_api, get_zhiyun_api, load_session
 from zju_zhiyun import ZhiyunApi
 
@@ -217,10 +217,20 @@ def fmt_ts(total_sec: int) -> str:
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
+def _no_proxy_opener() -> urllib.request.OpenerDirector:
+    """返回一个不读环境代理的 opener。
+
+    urllib 默认会通过 getproxies() 读取 HTTP_PROXY / HTTPS_PROXY，
+    在注入了代理变量的 Host（IDE / Agent 运行时）下会把校内直连的
+    图片下载请求送到代理，导致下载失败。
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def download_image(url: str, dest: Path) -> bool:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _no_proxy_opener().open(req, timeout=30) as resp:
             dest.write_bytes(resp.read())
         return True
     except Exception as e:
@@ -240,12 +250,25 @@ async def list_zhiyun_courses(api: ZhiyunApi) -> list[dict]:
 async def resolve_zhiyun_course(api: ZhiyunApi, keyword: str) -> dict | None:
     keyword = keyword.strip()
     courses = await list_zhiyun_courses(api)
-    # 精确包含匹配优先，其次模糊
-    exact = [c for c in courses if keyword and keyword in c.get("title", "")]
-    if exact:
-        return exact[0]
-    fuzzy = [c for c in courses if keyword and any(keyword[:2] in c.get("title", "") for _ in [0])]
-    return fuzzy[0] if fuzzy else (courses[0] if not keyword else None)
+    if not courses:
+        return None
+    if not keyword:
+        # 未给关键字：唯一课程才敢直接返回；多门课时拒绝猜测
+        return courses[0] if len(courses) == 1 else None
+
+    # 复用归一化匹配（兼容「XX（研）」vs「XX」写法差异）
+    matched = match_course_by_keyword(courses, keyword, key="title")
+    if matched is not None:
+        return matched
+
+    # 兜底：归一化后前两字命中（仅在无其他候选时）
+    kw_norm = normalize_course_name(keyword)
+    if len(kw_norm) >= 2:
+        cands = [c for c in courses
+                 if kw_norm[:2] in normalize_course_name(c.get("title", ""))]
+        if len(cands) == 1:
+            return cands[0]
+    return None
 
 
 def build_transcript_clean(segments: list[dict]) -> str:
@@ -413,29 +436,82 @@ async def collect_lecture(
     return meta
 
 
+# ──────────────────────── 课程名匹配（跨平台共用） ────────────────────────
+
+def normalize_course_name(name: str) -> str:
+    """归一化课程名用于跨平台匹配。
+
+    智云与学在浙大对同一门课的命名常有差异，例如：
+      - 智云「医学统计软件的应用（研）」 vs 学在浙大「医学统计软件的应用」
+      - 学在浙大偶有尾部制表符/全角空格
+    这里统一去掉学制后缀、括号注释与空白，只留主标题。
+    """
+    if not name:
+        return ""
+    s = str(name).strip()
+    # 去掉各类空白（含制表符、全角空格）
+    s = re.sub(r"[\s\u3000]+", "", s)
+    # 去掉括号及其中内容（含全角/半角），如「（研）」「(研究生)」
+    s = re.sub(r"[（(][^）)]*[）)]", "", s)
+    return s
+
+
+def match_course_by_keyword(courses: list[dict], keyword: str, key: str = "name") -> dict | None:
+    """在课程列表中按关键字匹配课程，归一化后比较。
+
+    匹配优先级：
+      1. 归一化后完全相等
+      2. 归一化后关键字包含
+      3. 原始字段包含关键字
+      4. 归一化后前两字命中
+    """
+    kw = str(keyword or "").strip()
+    if not kw:
+        return None
+    kw_norm = normalize_course_name(kw)
+
+    def names(c):
+        return str(c.get(key, "") or "")
+
+    # 1. 归一化完全相等
+    for c in courses:
+        if kw_norm and normalize_course_name(names(c)) == kw_norm:
+            return c
+    # 2. 归一化后包含
+    for c in courses:
+        if kw_norm and kw_norm in normalize_course_name(names(c)):
+            return c
+    # 3. 原字段包含
+    for c in courses:
+        if kw in names(c):
+            return c
+    # 4. 归一化后前两字命中
+    if len(kw_norm) >= 2:
+        for c in courses:
+            if kw_norm[:2] in normalize_course_name(names(c)):
+                return c
+    return None
+
+
 # ──────────────────────────── 学在浙大部分 ────────────────────────────
 
 async def _collect_xuezai_async(
-    courses_api: CoursesApi, keyword: str, out_dir: Path, skip_coursewares: bool
+    courses_api: CoursesApi, keyword: str, out_dir: Path, skip_coursewares: bool,
+    also_keywords: list[str] | None = None,
 ) -> dict:
     result = {"course_id": None, "course_name": "", "todos": [], "assignments": [], "coursewares": [], "downloaded": []}
 
     # 1. 课程列表 -> 匹配
     courses_data = await courses_api.get_my_courses(statuses=["ongoing", "notStarted"])
     all_courses = courses_data.get("courses", []) if isinstance(courses_data, dict) else courses_data
+
+    # 依次用主关键字与候选关键字尝试（智云名与学在浙大名可能不同）
+    candidates = [keyword] + [k for k in (also_keywords or []) if k and k != keyword]
     matched = None
-    kw = keyword.strip()
-    for c in all_courses:
-        name = c.get("name", "")
-        if kw and kw in name:
-            matched = c
+    for kw_try in candidates:
+        matched = match_course_by_keyword(all_courses, kw_try)
+        if matched is not None:
             break
-    if matched is None and all_courses:
-        # 模糊：前两个字
-        for c in all_courses:
-            if kw and kw[:2] in c.get("name", ""):
-                matched = c
-                break
 
     if matched is None:
         log("WARN", "学在浙大未匹配到课程", keyword=keyword)
@@ -452,9 +528,18 @@ async def _collect_xuezai_async(
     # 2. 全局 todos 过滤出该课程
     try:
         todos = await courses_api.get_todos()
+        # 用归一化名称比较，兼容「XX（研）」与「XX」的差异
+        norm_targets = {
+            normalize_course_name(k)
+            for k in ([keyword] + (also_keywords or []))
+            if normalize_course_name(k)
+        }
+        norm_matched = normalize_course_name(result["course_name"])
+        if norm_matched:
+            norm_targets.add(norm_matched)
         result["todos"] = [
             t for t in todos
-            if kw in (t.get("course_name") or "") or (result["course_name"] and result["course_name"] in (t.get("course_name") or ""))
+            if normalize_course_name(t.get("course_name")) in norm_targets
         ]
         result["all_todos_count"] = len(todos)
     except Exception as e:
@@ -572,7 +657,13 @@ async def _async_main(args):
     # 学在浙大部分（todos + 课件）
     try:
         courses_api = get_courses_api()
-        await _collect_xuezai_async(courses_api, keyword, out_dir, args.skip_coursewares)
+        # 智云与学在浙大课程名可能不同（如「XX（研）」vs「XX」），
+        # 把智云的实际课程名一并作为候选关键字。
+        zhiyun_title = course.get("title") or ""
+        await _collect_xuezai_async(
+            courses_api, keyword, out_dir, args.skip_coursewares,
+            also_keywords=[zhiyun_title],
+        )
     except Exception as e:
         log("WARN", "学在浙大数据获取失败（智云部分已完成）", err=str(e))
         (out_dir / "course_todos.json").write_text(
@@ -584,6 +675,7 @@ async def _async_main(args):
 
 def main():
     ensure_utf8_io()
+    ensure_direct_network()
     parser = argparse.ArgumentParser(description="按课次聚合智云 + 学在浙大数据")
     sub = parser.add_subparsers(dest="command")
 
