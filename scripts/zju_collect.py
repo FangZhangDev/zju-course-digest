@@ -1,0 +1,614 @@
+"""zju_collect.py — 按课次聚合智云 + 学在浙大数据到 data/课程名/YYYY-MM-DD/
+
+复用 zju-scholar 的接口实现（zju_session/zju_zhiyun/zju_api），
+不重新逆向任何接口。核心产出：
+
+  data/<课程名>/<YYYY-MM-DD>/
+    metadata.json          课程与讲次元信息
+    transcript_raw.json    原始 ASR 分段（start_sec/end_sec/text）
+    transcript_clean.txt   清洗后带时间戳的纯文本
+    slides.pdf             PPT 截图去重后合成 PDF
+    slide_timeline.json    PPT 页 -> created_sec -> 对应字幕区间
+    course_todos.json      学在浙大 todos + 课程作业活动
+    coursewares/           学在浙大原始课件（优先原始 PPT/PDF）
+
+用法：
+  python zju_collect.py list-courses                     # 列出智云+学在浙大课程
+  python zju_collect.py collect --course 数据科学         # 抓取该课最新一节
+  python zju_collect.py collect --course 数据科学 --sub-id 1912570
+  python zju_collect.py collect --course 数据科学 --date 2026-09-15
+  python zju_collect.py collect --course 数据科学 --skip-coursewares
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import struct
+import sys
+import urllib.request
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from zju_console import ensure_utf8_io
+from zju_session import get_courses_api, get_zhiyun_api, load_session
+from zju_zhiyun import ZhiyunApi
+
+# 学在浙大下载也需要 legacy DH SSL 兼容（与 zju_api 内部一致）
+from zju_api import CoursesApi
+
+TZ8 = timezone(timedelta(hours=8))
+
+URL_PPT = "https://classroom.zju.edu.cn/pptnote/v1/schedule/search-ppt"
+
+
+async def get_ppt_timeline_safe(api: ZhiyunApi, course_id: str, sub_id: str) -> list[dict]:
+    """PPT timeline 安全版。
+
+    上游 get_ppt_timeline 假设接口支持分页（page/per_page），但实测
+    search-ppt 接口忽略分页参数、一次性返回全部帧（265 帧 per_page=50/100/全量
+    均相同）。当帧数 >= per_page 时上游的 while True 循环永不终止。
+    这里改为单次请求直接取全量。
+    """
+    headers = api._headers.copy()
+    headers["Referer"] = f"https://classroom.zju.edu.cn/livingroom?sub_id={sub_id}"
+
+    async with api._make_client() as client:
+        resp = await client.get(
+            api._url(URL_PPT),
+            headers=headers,
+            params={"course_id": str(course_id), "sub_id": str(sub_id), "page": 1, "per_page": 10000},
+        )
+        data = resp.json()
+
+    timeline = []
+    for item in data.get("list", []) or []:
+        if not isinstance(item, dict):
+            continue
+        content = api._parse_embedded_json(item.get("content"))
+        timeline.append({
+            "course_id": str(course_id),
+            "sub_id": str(sub_id),
+            # 接口无唯一 slide id（id/old_id 均为空），用 created_sec 兼作标识
+            "slide_id": item.get("id") or item.get("old_id") or item.get("created_sec"),
+            "created_sec": int(item.get("created_sec", 0) or 0),
+            "image_url": content.get("pptimgurl", ""),
+            "title": content.get("title", ""),
+        })
+
+    # 按 created_sec 升序去重（同秒多帧保留一张）
+    timeline.sort(key=lambda x: x["created_sec"])
+    deduped = []
+    for t in timeline:
+        if deduped and deduped[-1]["created_sec"] == t["created_sec"]:
+            continue
+        deduped.append(t)
+    return deduped
+
+
+def log(level: str, message: str, **kv):
+    """标准日志：timestamp level: message key=value"""
+    parts = [f"{datetime.now(TZ8).isoformat(timespec='seconds')} {level}: {message}"]
+    parts += [f"{k}={v}" for k, v in kv.items()]
+    print(" ".join(parts), file=sys.stderr)
+
+
+def safe_dirname(name: str) -> str:
+    """课程名转安全目录名（保留中文，去掉路径非法字符）。"""
+    name = re.sub(r'[\\/:*?"<>|\s]+', "_", name.strip())
+    return name[:80] or "unknown_course"
+
+
+def jpeg_size(data: bytes) -> tuple[int, int, int]:
+    """解析 JPEG SOF，返回 (width, height, n_components)；失败返回 (0,0,0)。"""
+    from io import BytesIO
+    buf = BytesIO(data)
+    buf.read(2)  # SOI
+    while True:
+        marker = buf.read(2)
+        if len(marker) < 2 or marker[0] != 0xFF:
+            return 0, 0, 0
+        if marker[1] in (0xC0, 0xC1, 0xC2):
+            buf.read(3)  # length + precision
+            h = struct.unpack(">H", buf.read(2))[0]
+            w = struct.unpack(">H", buf.read(2))[0]
+            ncomp = buf.read(1)[0]
+            return w, h, ncomp
+        length = struct.unpack(">H", buf.read(2))[0]
+        buf.read(length - 2)
+
+
+def images_to_pdf(img_paths: list[str], output_path: Path):
+    """JPEG 合成 PDF（无依赖，规范结构：每页 Page 字典 + Image XObject + 内容流）。"""
+    PAGE_W, PAGE_H = 612, 792
+    n = len(img_paths)
+    pdf = b"%PDF-1.4\n"
+    offsets = []
+
+    # obj 1: Catalog
+    offsets.append(len(pdf))
+    pdf += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+
+    # obj 2: Pages（每页 3 个对象：page=3+i*3, img=4+i*3, content=5+i*3）
+    kids = " ".join(f"{3 + i * 3} 0 R" for i in range(n))
+    offsets.append(len(pdf))
+    pdf += f"2 0 obj\n<< /Type /Pages /Kids [{kids}] /Count {n} >>\nendobj\n".encode()
+
+    for i, img_path in enumerate(img_paths):
+        img_data = Path(img_path).read_bytes()
+        w, h, ncomp = jpeg_size(img_data)
+        if w == 0 or h == 0:
+            w, h, ncomp = 1280, 720, 3
+        colorspace = "DeviceGray" if ncomp == 1 else "DeviceRGB"
+        scale = min(PAGE_W / w, PAGE_H / h)
+        dw, dh = w * scale, h * scale
+        x, y = (PAGE_W - dw) / 2, (PAGE_H - dh) / 2
+
+        page_obj = 3 + i * 3
+        img_obj = page_obj + 1
+        content_obj = page_obj + 2
+
+        # Page 字典（上游 zju-scholar 缺失这一段，导致 PDF 无法按页渲染）
+        offsets.append(len(pdf))
+        pdf += (
+            f"{page_obj} 0 obj\n<< /Type /Page /Parent 2 0 R "
+            f"/MediaBox [0 0 {PAGE_W} {PAGE_H}] "
+            f"/Resources << /XObject << /Img{i} {img_obj} 0 R >> >> "
+            f"/Contents {content_obj} 0 R >>\nendobj\n"
+        ).encode()
+
+        # 图片 XObject
+        offsets.append(len(pdf))
+        pdf += (
+            f"{img_obj} 0 obj\n<< /Type /XObject /Subtype /Image /Width {w} /Height {h} "
+            f"/ColorSpace /{colorspace} /BitsPerComponent 8 /Filter /DCTDecode "
+            f"/Length {len(img_data)} >>\nstream\n"
+        ).encode() + img_data + b"\nendstream\nendobj\n"
+
+        # 页面内容流
+        content = f"q {dw:.2f} 0 0 {dh:.2f} {x:.2f} {y:.2f} cm /Img{i} Do Q".encode()
+        offsets.append(len(pdf))
+        pdf += (
+            f"{content_obj} 0 obj\n<< /Length {len(content)} >>\nstream\n"
+        ).encode() + content + b"\nendstream\nendobj\n"
+
+    xref_pos = len(pdf)
+    total_objs = 2 + n * 3 + 1
+    pdf += f"xref\n0 {total_objs}\n".encode()
+    pdf += b"0000000000 65535 f \n"
+    for off in offsets:
+        pdf += f"{off:010d} 00000 n \n".encode()
+    pdf += f"trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode()
+
+    output_path.write_bytes(pdf)
+
+
+def dedup_adjacent_indices(img_paths: list[str], threshold: int = 12) -> tuple[list[int], int]:
+    """相邻感知哈希去重，返回 (保留的索引列表, 去掉数量)。不删除文件。"""
+    try:
+        from PIL import Image
+        import imagehash
+    except ImportError:
+        log("WARN", "imagehash 未安装，跳过去重")
+        return list(range(len(img_paths))), 0
+
+    if len(img_paths) <= 1:
+        return list(range(len(img_paths))), 0
+
+    kept_idx = [0]
+    last_h = imagehash.phash(Image.open(img_paths[0]), hash_size=16)
+    for i, p in enumerate(img_paths[1:], start=1):
+        h = imagehash.phash(Image.open(p), hash_size=16)
+        if h - last_h > threshold:
+            kept_idx.append(i)
+            last_h = h
+    removed = len(img_paths) - len(kept_idx)
+    return kept_idx, removed
+
+
+def fmt_ts(total_sec: int) -> str:
+    """秒 -> HH:MM:SS"""
+    s = max(0, int(total_sec))
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def download_image(url: str, dest: Path) -> bool:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            dest.write_bytes(resp.read())
+        return True
+    except Exception as e:
+        log("WARN", f"PPT 图片下载失败 url={url} err={e}")
+        return False
+
+
+# ──────────────────────────── 智云部分 ────────────────────────────
+
+async def list_zhiyun_courses(api: ZhiyunApi) -> list[dict]:
+    recent = await api.get_recent_learning(per_page=20)
+    if recent:
+        return recent
+    return await api.get_my_courses()
+
+
+async def resolve_zhiyun_course(api: ZhiyunApi, keyword: str) -> dict | None:
+    keyword = keyword.strip()
+    courses = await list_zhiyun_courses(api)
+    # 精确包含匹配优先，其次模糊
+    exact = [c for c in courses if keyword and keyword in c.get("title", "")]
+    if exact:
+        return exact[0]
+    fuzzy = [c for c in courses if keyword and any(keyword[:2] in c.get("title", "") for _ in [0])]
+    return fuzzy[0] if fuzzy else (courses[0] if not keyword else None)
+
+
+def build_transcript_clean(segments: list[dict]) -> str:
+    """带时间戳的清洗纯文本：去口头语、合并重复，保留原始分段顺序。"""
+    filler_re = ZhiyunApi._strip_leading_fillers
+    lines = []
+    last = None
+    for seg in segments:
+        text = seg["text"]
+        text = filler_re(text)
+        if not text or ZhiyunApi._is_low_information_text(text):
+            continue
+        if text == last:
+            continue
+        last = text
+        lines.append(f"[{fmt_ts(seg['start_sec'])} - {fmt_ts(seg['end_sec'])}] {text}")
+    return "\n".join(lines)
+
+
+def build_slide_timeline(
+    timeline: list[dict], segments: list[dict]
+) -> list[dict]:
+    """PPT 页(created_sec) <-> 字幕区间(start/end) 对应。
+
+    每页 PPT 附：覆盖的字幕时间窗、页内出现的字幕文本（截断保存）。
+    """
+    result = []
+    for i, slide in enumerate(timeline):
+        created = slide["created_sec"]
+        next_created = timeline[i + 1]["created_sec"] if i + 1 < len(timeline) else None
+        # 本页显示期间的字幕：start_sec >= created 且 (下一页之前)
+        cover = [
+            seg for seg in segments
+            if seg["start_sec"] >= created and (next_created is None or seg["start_sec"] < next_created)
+        ]
+        result.append({
+            "page": i + 1,
+            "slide_id": slide.get("slide_id"),
+            "created_sec": created,
+            "created_hms": fmt_ts(created),
+            "image_url": slide.get("image_url", ""),
+            "title": slide.get("title", ""),
+            "speech_start_sec": cover[0]["start_sec"] if cover else None,
+            "speech_end_sec": cover[-1]["end_sec"] if cover else None,
+            "speech_text": "".join(s["text"] for s in cover)[:2000],
+        })
+    return result
+
+
+async def collect_lecture(
+    zhiyun: ZhiyunApi,
+    course: dict,
+    sub_id: str | None,
+    out_dir: Path,
+    *,
+    dedup_threshold: int = 12,
+    skip_slides: bool = False,
+) -> dict:
+    """抓一节课：字幕 + PPT + 时间轴对应。"""
+    course_id = str(course["course_id"])
+    course_title = course.get("title", "unknown")
+
+    if sub_id:
+        videos = await zhiyun.get_course_videos(course_id)
+        target = next((v for v in videos if str(v["sub_id"]) == str(sub_id)), None)
+        if target is None:
+            # catalogue 接口找不到就直接构造
+            target = {"sub_id": sub_id, "title": "", "start_at": "", "end_at": ""}
+    else:
+        videos = await zhiyun.get_course_videos(course_id)
+        if not videos:
+            raise RuntimeError(f"智云课程 {course_title} 没有可用视频")
+        # 优先选"有字幕的最新一节"（status=6）：
+        # 最新一节常尚未转码出字幕（status=2），抓了也没有内容
+        with_subs = [v for v in videos if str(v.get("status")) == "6"]
+        target = with_subs[0] if with_subs else videos[0]
+        sub_id = str(target["sub_id"])
+        if not with_subs:
+            log("WARN", "该课程所有讲次均无字幕（可能尚未转码完成）", sub_id=sub_id)
+
+    log("INFO", "开始抓取课次", course=course_title, sub_id=sub_id)
+    meta = {
+        "course_id": course_id,
+        "course_name": course_title,
+        "sub_id": str(sub_id),
+        "lecture_title": target.get("title") or target.get("sub_title") or "",
+        "lecturer": target.get("lecturer_name", "") or course.get("teacher", ""),
+        "start_at": target.get("start_at", ""),
+        "end_at": target.get("end_at", ""),
+        "duration_sec": target.get("duration", 0),
+        "collected_at": datetime.now(TZ8).isoformat(),
+    }
+
+    # ---- 字幕 ----
+    transcript_raw = await zhiyun.get_transcript(sub_id)
+    segments = ZhiyunApi._normalize_transcript_segments(transcript_raw)
+    meta["has_transcript"] = bool(segments)
+    meta["transcript_segments"] = len(segments)
+
+    (out_dir / "transcript_raw.json").write_text(
+        json.dumps({"sub_id": sub_id, "segments": segments}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    clean = build_transcript_clean(segments)
+    (out_dir / "transcript_clean.txt").write_text(clean, encoding="utf-8")
+    log("INFO", "字幕完成", segments=len(segments), clean_chars=len(clean))
+
+    # ---- PPT ----
+    timeline = [] if skip_slides else await get_ppt_timeline_safe(zhiyun, course_id, sub_id)
+    meta["ppt_frames"] = len(timeline)
+
+    if timeline:
+        tmpdir = out_dir / "_slides_tmp"
+        tmpdir.mkdir(exist_ok=True)
+        img_files = []
+        kept_timeline = []
+        for idx, slide in enumerate(timeline):
+            p = tmpdir / f"s{idx:04d}.jpg"
+            if download_image(slide["image_url"], p):
+                img_files.append(str(p))
+                kept_timeline.append(slide)
+
+        removed = 0
+        kept_indices = list(range(len(img_files)))
+        if img_files:
+            kept_indices, removed = dedup_adjacent_indices(img_files, dedup_threshold)
+            pdf_path = out_dir / "slides.pdf"
+            images_to_pdf([img_files[i] for i in kept_indices], pdf_path)
+            meta["slides_in_pdf"] = len(kept_indices)
+            meta["slides_dedup_removed"] = removed
+        else:
+            meta["slides_in_pdf"] = 0
+
+        # PDF 第 N 页对应 kept_indices[N-1] 帧的 created_sec
+        pdf_page_times = [kept_timeline[i]["created_sec"] for i in kept_indices if i < len(kept_timeline)]
+
+        slide_timeline = build_slide_timeline(timeline, segments)
+        # 每个 timeline 帧映射到它之前最近的保留帧（即 PDF 页码）
+        for entry in slide_timeline:
+            entry["pdf_page"] = None
+            best = None
+            for pdf_idx, t in enumerate(pdf_page_times):
+                if t <= entry["created_sec"] and (best is None or t > pdf_page_times[best]):
+                    best = pdf_idx
+            entry["pdf_page"] = (best + 1) if best is not None else None
+
+        (out_dir / "slide_timeline.json").write_text(
+            json.dumps(slide_timeline, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # 清理临时图片
+        for p in tmpdir.glob("*.jpg"):
+            p.unlink()
+        tmpdir.rmdir()
+        log("INFO", "PPT 完成", frames=len(timeline), in_pdf=len(kept_indices), removed=removed)
+    else:
+        (out_dir / "slide_timeline.json").write_text("[]", encoding="utf-8")
+        meta["slides_in_pdf"] = 0
+        log("INFO", "该课次无 PPT timeline")
+
+    (out_dir / "metadata.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return meta
+
+
+# ──────────────────────────── 学在浙大部分 ────────────────────────────
+
+async def _collect_xuezai_async(
+    courses_api: CoursesApi, keyword: str, out_dir: Path, skip_coursewares: bool
+) -> dict:
+    result = {"course_id": None, "course_name": "", "todos": [], "assignments": [], "coursewares": [], "downloaded": []}
+
+    # 1. 课程列表 -> 匹配
+    courses_data = await courses_api.get_my_courses(statuses=["ongoing", "notStarted"])
+    all_courses = courses_data.get("courses", []) if isinstance(courses_data, dict) else courses_data
+    matched = None
+    kw = keyword.strip()
+    for c in all_courses:
+        name = c.get("name", "")
+        if kw and kw in name:
+            matched = c
+            break
+    if matched is None and all_courses:
+        # 模糊：前两个字
+        for c in all_courses:
+            if kw and kw[:2] in c.get("name", ""):
+                matched = c
+                break
+
+    if matched is None:
+        log("WARN", "学在浙大未匹配到课程", keyword=keyword)
+        (out_dir / "course_todos.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return result
+
+    course_id = matched["id"]
+    result["course_id"] = str(course_id)
+    result["course_name"] = matched.get("name", "")
+    log("INFO", "学在浙大课程匹配", course=result["course_name"], course_id=course_id)
+
+    # 2. 全局 todos 过滤出该课程
+    try:
+        todos = await courses_api.get_todos()
+        result["todos"] = [
+            t for t in todos
+            if kw in (t.get("course_name") or "") or (result["course_name"] and result["course_name"] in (t.get("course_name") or ""))
+        ]
+        result["all_todos_count"] = len(todos)
+    except Exception as e:
+        log("WARN", "获取 todos 失败", err=str(e))
+
+    # 3. 课程活动里的作业类（assignment/homework 类型）
+    try:
+        activities = await courses_api.get_course_activities(course_id)
+        for act in activities:
+            atype = str(act.get("type", "")).lower()
+            if any(k in atype for k in ("assignment", "homework", "exam", "quiz")):
+                result["assignments"].append({
+                    "activity_id": act.get("id"),
+                    "title": act.get("title", ""),
+                    "type": act.get("type", ""),
+                    "end_time": act.get("end_time") or act.get("due_at") or "",
+                    "start_time": act.get("start_time") or "",
+                    "status": act.get("status", ""),
+                })
+    except Exception as e:
+        log("WARN", "获取课程活动失败", err=str(e))
+
+    (out_dir / "course_todos.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log("INFO", "todos 完成", todos=len(result["todos"]), assignments=len(result["assignments"]))
+
+    # 4. 课件下载
+    if skip_coursewares:
+        return result
+
+    cw_dir = out_dir / "coursewares"
+    cw_dir.mkdir(exist_ok=True)
+    try:
+        cws = await courses_api.get_coursewares(course_id, page_size=100)
+        items = cws.get("coursewares", []) if isinstance(cws, dict) else []
+        result["coursewares"] = [
+            {k: v for k, v in it.items() if k != "raw"} for it in items
+        ]
+        for it in items:
+            upload_id = it.get("upload_id")
+            name = it.get("name") or f"upload_{upload_id}"
+            if not upload_id:
+                continue
+            dest = cw_dir / name
+            if dest.exists() and dest.stat().st_size > 0:
+                result["downloaded"].append({"name": name, "skipped": "exists"})
+                continue
+            try:
+                dl = await courses_api.download_resource(upload_id, cw_dir)
+                result["downloaded"].append(dl)
+                log("INFO", "课件下载", name=name, size=dl.get("size", 0))
+            except Exception as e:
+                result["downloaded"].append({"name": name, "error": str(e)})
+                log("WARN", "课件下载失败", name=name, err=str(e))
+    except Exception as e:
+        log("WARN", "获取课件列表失败", err=str(e))
+
+    # 下载完成后把 course_todos.json 重写（补 downloaded）
+    (out_dir / "course_todos.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return result
+
+
+# ──────────────────────────── CLI ────────────────────────────
+
+async def _async_main(args):
+    session = load_session()
+    if not session:
+        print(json.dumps({"ok": False, "error": "未登录，先运行 zju_login.py"}, ensure_ascii=False))
+        sys.exit(2)
+
+    base = Path(args.data_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+
+    if args.command == "list-courses":
+        zhiyun = get_zhiyun_api()
+        zy = await list_zhiyun_courses(zhiyun)
+        try:
+            courses_api = get_courses_api()
+            xz_data = await courses_api.get_my_courses(statuses=["ongoing", "notStarted"])
+            xz = xz_data.get("courses", []) if isinstance(xz_data, dict) else xz_data
+        except Exception as e:
+            log("WARN", "学在浙大课程列表失败", err=str(e))
+            xz = []
+        print(json.dumps({
+            "ok": True,
+            "zhiyun": [{"course_id": c.get("course_id"), "title": c.get("title"), "teacher": c.get("teacher") or c.get("lecturer_name", "")} for c in zy],
+            "xuezai": [{"course_id": c.get("id"), "name": c.get("name"), "teachers": c.get("instructors", [])} for c in xz],
+        }, ensure_ascii=False, indent=2))
+        return
+
+    # collect
+    keyword = args.course
+    zhiyun = get_zhiyun_api()
+
+    course = await resolve_zhiyun_course(zhiyun, keyword)
+    if course is None:
+        print(json.dumps({"ok": False, "error": f"智云未找到课程: {keyword}"}, ensure_ascii=False))
+        sys.exit(1)
+
+    course_dirname = safe_dirname(course.get("title") or keyword)
+    date_str = args.date or datetime.now(TZ8).strftime("%Y-%m-%d")
+    out_dir = base / course_dirname / date_str
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log("INFO", "输出目录", path=str(out_dir))
+
+    meta = await collect_lecture(
+        zhiyun, course, args.sub_id, out_dir,
+        dedup_threshold=args.dedup_threshold,
+        skip_slides=args.no_slides,
+    )
+
+    # 学在浙大部分（todos + 课件）
+    try:
+        courses_api = get_courses_api()
+        await _collect_xuezai_async(courses_api, keyword, out_dir, args.skip_coursewares)
+    except Exception as e:
+        log("WARN", "学在浙大数据获取失败（智云部分已完成）", err=str(e))
+        (out_dir / "course_todos.json").write_text(
+            json.dumps({"error": str(e)}, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    print(json.dumps({"ok": True, "course_dir": str(out_dir), "meta": meta}, ensure_ascii=False, indent=2))
+
+
+def main():
+    ensure_utf8_io()
+    parser = argparse.ArgumentParser(description="按课次聚合智云 + 学在浙大数据")
+    sub = parser.add_subparsers(dest="command")
+
+    p_list = sub.add_parser("list-courses", help="列出智云 + 学在浙大当前课程")
+    p_list.add_argument("--data-dir", default=None)
+
+    p_col = sub.add_parser("collect", help="抓取一节课")
+    p_col.add_argument("--course", required=True, help="课程名关键字")
+    p_col.add_argument("--sub-id", default=None, help="指定智云 sub_id（默认最新一节）")
+    p_col.add_argument("--date", default=None, help="输出目录日期 YYYY-MM-DD（默认今天）")
+    p_col.add_argument("--data-dir", default=None, help="数据根目录（默认 <skill>/data/courses）")
+    p_col.add_argument("--skip-coursewares", action="store_true", help="跳过学在浙大课件下载")
+    p_col.add_argument("--no-slides", action="store_true", help="跳过 PPT 下载")
+    p_col.add_argument("--dedup-threshold", type=int, default=12, help="相邻帧哈希距离阈值（默认12，越大去重越狠）")
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.data_dir is None:
+        args.data_dir = Path(__file__).resolve().parent.parent / "data" / "courses"
+
+    asyncio.run(_async_main(args))
+
+
+if __name__ == "__main__":
+    main()

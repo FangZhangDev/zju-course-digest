@@ -1,0 +1,10 @@
+# 个人数据与凭证 —— 严禁提交
+data/
+cache/
+output/
+credentials*.json
+session*.json
+profile*.json
+
+__pycache__/
+*.pyc
