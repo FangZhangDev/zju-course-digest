@@ -241,10 +241,32 @@ def download_image(url: str, dest: Path) -> bool:
 # ──────────────────────────── 智云部分 ────────────────────────────
 
 async def list_zhiyun_courses(api: ZhiyunApi) -> list[dict]:
-    recent = await api.get_recent_learning(per_page=20)
-    if recent:
-        return recent
-    return await api.get_my_courses()
+    """列出智云课程：合并「近期学习」与「我的课程」，去重后返回。
+
+    不能只取「近期学习」：那是有过观看记录才会出现的列表，刚开课、或从未在线上
+    打开过的新课不会在里面，导致 list-courses 看不到、collect 也匹配不到该课程。
+    这里以近期学习优先、再补上我的课程，按 course_id 去重。
+    """
+    merged: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(items):
+        for c in items or []:
+            cid = str(c.get("course_id") or "")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            merged.append(c)
+
+    try:
+        _add(await api.get_recent_learning(per_page=20))
+    except Exception as exc:  # noqa: BLE001
+        log("WARN", "获取智云「近期学习」失败", err=str(exc))
+    try:
+        _add(await api.get_my_courses(per_page=100))
+    except Exception as exc:  # noqa: BLE001
+        log("WARN", "获取智云「我的课程」失败", err=str(exc))
+    return merged
 
 
 async def resolve_zhiyun_course(api: ZhiyunApi, keyword: str) -> dict | None:
@@ -326,6 +348,7 @@ async def collect_lecture(
     *,
     dedup_threshold: int = 12,
     skip_slides: bool = False,
+    keep_slides_tmp: bool = False,
 ) -> dict:
     """抓一节课：字幕 + PPT + 时间轴对应。"""
     course_id = str(course["course_id"])
@@ -420,10 +443,20 @@ async def collect_lecture(
             encoding="utf-8",
         )
 
-        # 清理临时图片
-        for p in tmpdir.glob("*.jpg"):
-            p.unlink()
-        tmpdir.rmdir()
+        # 清理临时图片。
+        # 注意：这一步只是收尾，失败不应影响已产出的 slides.pdf / slide_timeline.json。
+        # 某些 IDE / Agent 运行时会对批量删除做二次确认（或沙箱拦截），
+        # 直接抛出会让整次采集前功尽弃，因此这里吞掉异常并提示可手动删除。
+        keep_tmp = os.environ.get("ZJU_KEEP_SLIDES_TMP") == "1" or keep_slides_tmp
+        if keep_tmp:
+            log("INFO", "保留临时图片目录", path=str(tmpdir))
+        else:
+            try:
+                for p in tmpdir.glob("*.jpg"):
+                    p.unlink()
+                tmpdir.rmdir()
+            except Exception as exc:  # noqa: BLE001 - 清理失败不影响产物
+                log("WARN", "临时图片清理失败，可手动删除该目录", path=str(tmpdir), error=str(exc))
         log("INFO", "PPT 完成", frames=len(timeline), in_pdf=len(kept_indices), removed=removed)
     else:
         (out_dir / "slide_timeline.json").write_text("[]", encoding="utf-8")
@@ -652,6 +685,7 @@ async def _async_main(args):
         zhiyun, course, args.sub_id, out_dir,
         dedup_threshold=args.dedup_threshold,
         skip_slides=args.no_slides,
+        keep_slides_tmp=args.keep_slides_tmp,
     )
 
     # 学在浙大部分（todos + 课件）
@@ -690,6 +724,7 @@ def main():
     p_col.add_argument("--skip-coursewares", action="store_true", help="跳过学在浙大课件下载")
     p_col.add_argument("--no-slides", action="store_true", help="跳过 PPT 下载")
     p_col.add_argument("--dedup-threshold", type=int, default=12, help="相邻帧哈希距离阈值（默认12，越大去重越狠）")
+    p_col.add_argument("--keep-slides-tmp", action="store_true", help="保留 PPT 中间图目录 _slides_tmp（调试用）")
     args = parser.parse_args()
 
     if args.command is None:
